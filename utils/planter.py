@@ -33,8 +33,8 @@ def normalize_outflow_by_pop_mil(df):
     assert (
         "migrations_from_each_city" in df.columns and "population" in df.columns
     ), "migrations_from_each_city or population are not in df.columns"
-    return cities["migrations_from_each_city"] * (
-        cities["population"] / POPULATION_NORMALIZATION_VALUE
+    return cities["migrations_from_each_city"] * ( #type: ignore
+        cities["population"] / POPULATION_NORMALIZATION_VALUE #type: ignore
     )
 
 def define_scaler():
