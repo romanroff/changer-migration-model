@@ -4,7 +4,7 @@ annotated-types==0.7.0
 asttokens==3.0.0
 attrs==25.3.0
 autograd==1.8.0
--e git+https://github.com/aimclub/blocksnet.git@6b48505ff03ac5ffb385030af66e635a50bd5c95#egg=blocksnet
+# -e git+https://github.com/aimclub/blocksnet.git@6b48505ff03ac5ffb385030af66e635a50bd5c95#egg=blocksnet
 branca==0.8.1
 certifi==2025.6.15
 charset-normalizer==3.4.2
@@ -23,14 +23,14 @@ dill==0.4.0
 exceptiongroup==1.3.0
 executing==2.2.0
 fiona==1.10.1
-folium==0.12.1.post1
+# folium==0.12.1.post1
 fonttools==4.58.4
 geojson==2.5.0
-geopandas==1.1.0
+# geopandas==1.1.0
 grapheme==0.6.0
 h3==3.7.7
 idna==3.10
-iduedu==0.4.1
+# iduedu==0.4.1
 igraph==0.9.11
 ipykernel==6.29.5
 ipython==8.37.0
@@ -43,7 +43,7 @@ jupyter_core==5.8.1
 jupyterlab_widgets==3.0.15
 kiwisolver==1.4.8
 llvmlite==0.44.0
-loguru==0.7.0
+loguru<0.8.0
 mapclassify==2.8.1
 MarkupSafe==3.0.2
 matplotlib==3.10.3
@@ -55,9 +55,9 @@ nest-asyncio==1.6.0
 networkx==3.4.2
 numba==0.61.2
 numpy==1.26.4
-osmnx==1.6.0
+# osmnx==1.6.0
 packaging==25.0
-pandas==2.3.0
+# pandas==2.3.0
 pandera==0.20.2
 parso==0.8.4
 patsy==1.0.1
@@ -69,7 +69,7 @@ prompt_toolkit==3.0.51
 psutil==7.0.0
 PuLP==2.7.0
 pure_eval==0.2.3
-pyarrow==19.0.1
+# pyarrow==19.0.1
 pydantic==2.11.7
 pydantic_core==2.33.2
 Pygments==2.19.2
@@ -84,10 +84,10 @@ pywin32==310
 pyzmq==27.0.0
 requests==2.31.0
 scikit-learn==1.5.2
-scikit-mobility==1.3.1
+# scikit-mobility==1.3.1
 scipy==1.15.3
 seaborn==0.12.2
-shapely==2.0.5
+# shapely==2.0.5
 six==1.16.0
 stack-data==0.6.3
 statsmodels==0.13.5
