@@ -3,7 +3,7 @@ import itertools
 from dataclasses import dataclass, field
 from functools import singledispatchmethod
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -316,7 +316,6 @@ class MigrationFlowModel:
         for service_type in self.model.service_types:
             if service_type.name in services:
                 _, _, _, l_gdf = self.provision.calculate(service_type)
-                print(f"✔ {service_type.name:<15} was processed")
                 l_gdf.to_parquet(out_dir / f"{service_type.name}_links.parquet")
 
     def _compute_self_sufficiency(self, movement_matrix_csr: csr_matrix) -> Tuple[pd.DataFrame, np.ndarray]:

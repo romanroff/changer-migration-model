@@ -98,4 +98,13 @@ def count_change_capacity(df: pd.DataFrame, name: str, percent: float):
     return int(capacity.loc[df.town_name == name].item())
 
 def get_ueqi(wff, name):
-    pass
+    city = wff.cities[wff.cities['region_city'].str.contains(name)]
+    return city[
+                ['region_city',
+                "ueqi_residential",
+                "ueqi_street_networks",
+                "ueqi_green_spaces",
+                "ueqi_public_and_business_infrastructure",
+                "ueqi_social_and_leisure_infrastructure",
+                "ueqi_citywide_space"]
+            ].round(3)
