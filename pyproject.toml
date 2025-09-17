@@ -10,7 +10,6 @@ version = "0.1.0"
 authors = [{ name = "Roman Bashirov" }]
 license = { text = "MIT" }
 requires-python = ">=3.10, <3.11"
-# прямые зависимости (без транзитивных), мягкие пины
 dependencies = [
   "townsnet==0.0.9",
   "geojson",
@@ -43,7 +42,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["changer_migration*"]
+include = ["changer_migration*", "utils"]
 
 [tool.setuptools_scm]
 # версия берётся из git-тегов; fallback, если нет тега:
