@@ -46,6 +46,12 @@ class MigrationFlowModel:
     anchor: Optional[gpd.GeoDataFrame] = field(default=None, init=False)  # города + признаки якоря
     mobility: Optional[Dict[str, pd.DataFrame]] = field(default=None, init=False)
 
+    # --- Групповые результаты ---
+    group_matrices: Dict[str, csr_matrix] = field(default_factory=dict, init=False)
+    group_flows: Dict[str, gpd.GeoDataFrame] = field(default_factory=dict, init=False)
+    group_mobility: Dict[str, Dict[str, pd.DataFrame]] = field(default_factory=dict, init=False)
+
+
     # --- Параметры/seed ---
     seed: Optional[int] = None  # детерминизм по желанию
 
@@ -219,7 +225,6 @@ class MigrationFlowModel:
     
     def load_migration_matrix(
         self,
-        infra_keys: str | Sequence[str],
         *,
         matrix_dir: str | Path = DEFAULT_MATRIX_DIR,
         use_updated: bool = False,
@@ -227,70 +232,80 @@ class MigrationFlowModel:
         anchors: Optional[pd.DataFrame] = None,
     ) -> None:
         """
-        Загрузить и агрегировать матрицы связей по нужным сервисам в CSR-матрицу.
+        Загружает и агрегирует матрицы связей по всем группам из self.INFRASTRUCTURE.
+        Для каждой группы формирует:
+        • CSR-матрицу (self.group_matrices[group_name])
+        • GeoDataFrame потоков (self.group_flows[group_name])
         Также формирует GeoDataFrame self.anchor (города + флаг якоря).
         """
         if self.towns is None:
             raise RuntimeError("Towns GeoDataFrame is not initialized.")
 
         total_nodes = self.towns.shape[0]
-        keys_flat = [infra_keys] if isinstance(infra_keys, str) else list(
-            itertools.chain.from_iterable([k] if isinstance(k, str) else k for k in infra_keys)
-        )
-
-        # валидация ключей
-        invalid = [k for k in keys_flat if k not in self.INFRASTRUCTURE]
-        if invalid:
-            raise ValueError(f"Неверные ключи: {invalid}. Доступные: {list(self.INFRASTRUCTURE.keys())}")
-
-        all_services = list(itertools.chain.from_iterable(self.INFRASTRUCTURE[k] for k in keys_flat))
-
-        report = {"loaded": [], "missing": [], "errors": []}
-        loaded_count = 0
-
-        self.combined_matrix = csr_matrix((total_nodes, total_nodes), dtype=np.float64)
-
         base_path = Path(matrix_dir)
-        for key in tqdm(all_services, desc="Загрузка матриц связей"):
-            try:
-                filename = f"{key}_links.parquet"
-                updated_path = base_path / UPDATED_SUBDIR / filename
-                file_path = base_path / filename
 
-                if use_updated and updated_path.exists():
-                    df_rel = pd.read_parquet(updated_path)
-                    source = "updated"
-                elif file_path.exists():
-                    df_rel = pd.read_parquet(file_path)
-                    source = "original"
-                else:
-                    report["missing"].append(key)
-                    continue
+        global_report = {}
 
-                valid = df_rel[(df_rel["from"] < total_nodes) & (df_rel["to"] < total_nodes)]
-                rows = valid["from"].to_numpy()
-                cols = valid["to"].to_numpy()
-                data = valid["demand"].astype(np.float64).to_numpy()
+        for group_name, services in self.INFRASTRUCTURE.items():
+            report = {"loaded": [], "missing": [], "errors": []}
+            loaded_count = 0
+            combined = csr_matrix((total_nodes, total_nodes), dtype=np.float64)
 
-                self.combined_matrix += csr_matrix((data, (rows, cols)), shape=(total_nodes, total_nodes))
-                loaded_count += 1
-                report["loaded"].append(f"{key} ({source})")
-            except Exception as e:
-                report["errors"].append(f"Ошибка загрузки {key}: {e}")
+            for service in tqdm(services, desc=f"Группа {group_name}"):
+                try:
+                    filename = f"{service}_links.parquet"
+                    updated_path = base_path / UPDATED_SUBDIR / filename
+                    file_path = base_path / filename
 
-        if average and loaded_count > 0:
-            self.combined_matrix /= loaded_count
-        print(f"Результат загрузки матриц связей:\n{report}")
-        
-        # построим GeoDataFrame self.flows
-        self._build_flows()
+                    if use_updated and updated_path.exists():
+                        df_rel = pd.read_parquet(updated_path)
+                        source = "updated"
+                    elif file_path.exists():
+                        df_rel = pd.read_parquet(file_path)
+                        source = "original"
+                    else:
+                        report["missing"].append(service)
+                        continue
 
-        # соберём self.anchor (города + флаг якорности)
+                    valid = df_rel[
+                        (df_rel["from"] < total_nodes) & (df_rel["to"] < total_nodes)
+                    ]
+                    rows = valid["from"].to_numpy()
+                    cols = valid["to"].to_numpy()
+                    data = valid["demand"].astype(np.float64).to_numpy()
+
+                    combined += csr_matrix((data, (rows, cols)), shape=(total_nodes, total_nodes))
+                    loaded_count += 1
+                    report["loaded"].append(f"{service} ({source})")
+                except Exception as e:
+                    report["errors"].append(f"Ошибка {service}: {e}")
+
+            # усреднение по количеству сервисов
+            if average and loaded_count > 0:
+                combined /= loaded_count
+
+            # сохранить матрицу группы
+            self.group_matrices[group_name] = combined
+
+            # построить потоки для данной группы
+            self.combined_matrix = combined
+            self._build_flows()
+            self.group_flows[group_name] = self.flows.copy()
+
+            global_report[group_name] = report
+
+        # --- Сводный отчёт ---
+        print("Результат загрузки групп матриц:")
+        for group, rep in global_report.items():
+            print(f"\n[{group}]")
+            for k, v in rep.items():
+                print(f"  {k}: {len(v)}")
+
+        # --- Формирование self.anchor ---
         cities = self.towns.reset_index(drop=True)[["town_name", "geometry"]].copy()
         cities["population"] = self.towns["population"].values
 
         if anchors is not None and "is_anchor_settlement" in anchors.columns:
-            # приведём индексы в общий вид
             anchor_flag = anchors["is_anchor_settlement"].astype(bool).reset_index(drop=True)
             anchor_flag = anchor_flag.reindex(range(len(cities)), fill_value=False)
         else:
@@ -466,46 +481,81 @@ class MigrationFlowModel:
 
     def analyze_mobility(self, anchor_threshold: float = 75.0) -> Dict[str, pd.DataFrame]:
         """
-        Анализ мобильности: самообеспеченность, покрытие опорными пунктами, статистика и потенциальные опорные.
-        Возвращает словарь с DataFrame.
+        Анализ мобильности для каждой группы из `group_matrices` и для текущей `combined_matrix`.
+        Для каждой матрицы вычисляются:
+        - self_sufficiency
+        - anchor_coverage
+        - anchor_stats
+        - potential_anchors
+
+        Результаты по всем группам сохраняются в `self.group_mobility[group_name]`.
+        Возвращает результаты для текущей `self.combined_matrix` (для совместимости с существующим кодом).
         """
-        if self.combined_matrix is None:
-            raise RuntimeError("combined_matrix is not initialized.")
         if self.anchor is None:
             raise RuntimeError("anchor GeoDataFrame is not initialized.")
 
-        movement_matrix_csr = csr_matrix(self.combined_matrix)
+        def _analyze_for_matrix(matrix: csr_matrix) -> Dict[str, pd.DataFrame]:
+            movement_matrix_csr = csr_matrix(matrix)
 
-        # обнулим диагональ
-        mm = movement_matrix_csr.tolil()
-        mm.setdiag(0)
-        movement_matrix_csr = mm.tocsr()
+            mm = movement_matrix_csr.tolil()
+            mm.setdiag(0)
+            movement_matrix_csr = mm.tocsr()
 
-        anchor_ids = self.anchor[self.anchor["is_anchor_settlement"]].index.tolist()
-        non_anchor_ids = self.anchor[~self.anchor["is_anchor_settlement"]].index.tolist()
+            anchor_ids = self.anchor[self.anchor["is_anchor_settlement"]].index.tolist()
+            non_anchor_ids = self.anchor[~self.anchor["is_anchor_settlement"]].index.tolist()
 
-        mobility: Dict[str, pd.DataFrame] = {}
+            result: Dict[str, pd.DataFrame] = {}
 
-        self_sufficiency_df, self_sufficiency_pct = self._compute_self_sufficiency(movement_matrix_csr)
-        mobility["self_sufficiency"] = self_sufficiency_df
+            self_sufficiency_df, self_sufficiency_pct = self._compute_self_sufficiency(movement_matrix_csr)
+            result["self_sufficiency"] = self_sufficiency_df
 
-        coverage_df = self._compute_anchor_coverage(movement_matrix_csr, anchor_ids, non_anchor_ids)
-        mobility["anchor_coverage"] = coverage_df
+            coverage_df = self._compute_anchor_coverage(movement_matrix_csr, anchor_ids, non_anchor_ids)
+            result["anchor_coverage"] = coverage_df
 
-        anchor_stats_df = self._compute_anchor_stats(coverage_df, self_sufficiency_df, anchor_ids)
-        mobility["anchor_stats"] = anchor_stats_df
+            anchor_stats_df = self._compute_anchor_stats(coverage_df, self_sufficiency_df, anchor_ids)
+            result["anchor_stats"] = anchor_stats_df
 
-        potential_anchors_df = self._compute_potential_anchors(
-            movement_matrix_csr, self_sufficiency_pct, non_anchor_ids, anchor_threshold
-        )
-        mobility["potential_anchors"] = potential_anchors_df
+            potential_anchors_df = self._compute_potential_anchors(
+                movement_matrix_csr, self_sufficiency_pct, non_anchor_ids, anchor_threshold
+            )
+            result["potential_anchors"] = potential_anchors_df
 
-        self.mobility = mobility
-        return mobility
+            return result
+
+        # 1) Посчитать по всем группам (если они есть)
+        self.group_mobility = {}
+        if self.group_matrices:
+            for group_name, matrix in self.group_matrices.items():
+                try:
+                    self.group_mobility[group_name] = _analyze_for_matrix(matrix)
+                except Exception as e:
+                    # Не прерываем весь анализ, но сообщаем в консоль
+                    print(f"[analyze_mobility] Ошибка в группе '{group_name}': {e}")
+
+        # 2) Совместимость: вернуть и сохранить результаты для текущей combined_matrix
+        if self.combined_matrix is None:
+            # Если combined_matrix не задана, но группы посчитаны —
+            # вернём последние результаты группы (если есть)
+            if self.group_mobility:
+                last_group = next(reversed(self.group_mobility))
+                self.mobility = self.group_mobility[last_group]
+                return self.mobility
+            raise RuntimeError("combined_matrix is not initialized.")
+
+        mobility_current = _analyze_for_matrix(self.combined_matrix)
+        self.mobility = mobility_current
+        return self.group_mobility
 
     def create_map(self, polygons_gdf: Optional[gpd.GeoDataFrame] = None):
         if self.combined_matrix is None or self.anchor is None or self.mobility is None:
             raise RuntimeError("Run load_migration_matrix() and analyze_mobility() first.")
-        return create_anchor_flow_map(self.combined_matrix, self.anchor, self.mobility, polygons_gdf=polygons_gdf)
+        return create_anchor_flow_map(
+            self.combined_matrix,
+            self.anchor,
+            self.mobility,
+            polygons_gdf=polygons_gdf,
+            group_mobility=self.group_mobility,
+            group_matrices=self.group_matrices,
+        )
 
 

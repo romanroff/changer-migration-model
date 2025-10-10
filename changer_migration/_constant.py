@@ -9,7 +9,7 @@ BAD_CLIMATE_W_COEFF = 3
 MIN_FLOW_VALUE = 1
 
 DISTANCE_TRASHOLD_METERS = (
-    1e6  # 250km as a max value for potential migration, exper evaluation
+    1e6 
 )
 DESTINATION_EXP_COEFF = 5
 ORIGIN_EXP_COEFF = 1
