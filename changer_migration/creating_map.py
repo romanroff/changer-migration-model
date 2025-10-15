@@ -1,8 +1,11 @@
 import matplotlib.pyplot as plt
+from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 import numpy as np
 import folium
+from shapely.geometry import LineString
+from matplotlib.collections import LineCollection
 
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
@@ -112,31 +115,6 @@ def create_anchor_flow_map(
     self_sufficiency_df = analysis_results['self_sufficiency'].set_index(
         'city_id')
 
-    def create_tooltip(city_id):
-        name = id_to_name[city_id]
-        row = self_sufficiency_df.loc[city_id]
-
-        tooltip = f"<b>{name}</b><br>"
-        tooltip += f"Самообеспеченность: {row['self_sufficiency_pct']:.1f}%<br>"
-        tooltip += f"Тип: {row['city_type']}<br>"
-        if is_anchor.get(city_id, False):
-            tooltip += f"(Опорный пункт)<br>"
-            anchor_stats = analysis_results.get('anchor_stats', pd.DataFrame())
-            if not anchor_stats.empty:
-                stats = anchor_stats[anchor_stats['anchor_id'] == city_id]
-                if not stats.empty:
-                    stats = stats.iloc[0]
-                    if stats['is_weak_anchor']:
-                        tooltip += f"<b>Слабый опорный пункт</b><br>"
-                    tooltip += f"Средняя обеспеченность других: {stats['mean_coverage']:.1f}%<br>"
-                    tooltip += f"Медианная обеспеченность других: {stats['median_coverage']:.1f}%<br>"
-                    tooltip += f"Обеспечивает городов: {int(stats['num_covered_cities'])}"
-        else:
-            pot_df = analysis_results.get('potential_anchors', pd.DataFrame())
-            if not pot_df.empty and (pot_df['city_id'] == city_id).any():
-                tooltip += f"<b>Потенциальный опорный пункт</b><br>"
-        return tooltip
-
     # ---- Enhanced per-group tooltip data (override) ----
     # Prepare per-group self-sufficiency (0..1) and inflow per city
     per_group_self = None
@@ -171,25 +149,44 @@ def create_anchor_flow_map(
         potential_ids = set(pot_df0['city_id'].tolist())
 
     def _fmt_self(val: float) -> str:
-        return f"{val:.2f} ({val*100:.0f}%)"
+        return f"{val*100:.0f}%"
 
     def _block_header(text: str) -> str:
         return f"<div style=\"margin-top:6px; margin-bottom:2px; font-weight:600;\">{text}</div>"
 
+    def _list_kv_aligned(items: list[tuple[str, str]]) -> str:
+        if not items:
+            return "<i>Нет данных</i>"
+        rows = []
+        for k, v in items:
+            rows.append(
+                "<div style=\"display:flex; align-items:baseline; gap:8px;\">"
+                f"<span style=\"flex:1 1 auto; text-align:left;\">• {k}:</span>"
+                f"<span style=\"flex:0 0 auto; text-align:right;\">{v}</span>"
+                "</div>"
+            )
+        return "".join(rows)
     def _list_kv(items: list[tuple[str, str]]) -> str:
         if not items:
             return "<i>нет данных</i>"
         return "".join([f"<div>• {k}: {v}</div>" for k, v in items])
 
-    # Override tooltip to include 3 city types and per-infrastructure details
+    # Override tooltip to include statuses and per-infrastructure details
     def create_tooltip(city_id):
         name = id_to_name[city_id]
-        _ = self_sufficiency_df.loc[city_id]
+        row = self_sufficiency_df.loc[city_id]
 
         is_anchor_city = bool(is_anchor.get(city_id, False))
         is_potential = (not is_anchor_city) and (city_id in potential_ids)
 
         html = [f"<b>{name}</b>"]
+        # Population line right after city name
+        try:
+            pop_val = float(row.get("population", np.nan))
+        except Exception:
+            pop_val = np.nan
+        if not np.isnan(pop_val):
+            html.append(f"<div>Население, чел: <b>{int(round(pop_val))}</b></div>")
         if is_anchor_city:
             html.append("<div>Статус: <b>Опорный пункт</b></div>")
         elif is_potential:
@@ -203,11 +200,16 @@ def create_anchor_flow_map(
                 s = per_group_self.get(grp)
                 if s is None or city_id not in s.index:
                     continue
-                items.append((grp, _fmt_self(float(s.loc[city_id]))))
+                share = float(s.loc[city_id])
+                if not np.isnan(pop_val):
+                    served = int(round(pop_val * share))
+                    items.append((grp, f"{served:.0f} ({_fmt_self(share)})"))
+                else:
+                    items.append((grp, _fmt_self(share)))
             header_txt = "Градообслуживающие функции:" if (
                 is_anchor_city or is_potential) else "Самообеспеченность:"
             html.append(_block_header(header_txt))
-            html.append(_list_kv(items))
+            html.append(_list_kv_aligned(items))
         else:
             header_txt = "Градообслуживающие функции:" if (
                 is_anchor_city or is_potential) else "Самообеспеченность:"
@@ -223,23 +225,33 @@ def create_anchor_flow_map(
         top_value = -1.0
         if per_group_inflow:
             items = []
+            total_inflow = 0.0
+            for grp in group_names_order:
+                infl = per_group_inflow.get(grp)
+                if infl is None or city_id >= len(infl):
+                    continue
+                total_inflow += float(infl[city_id])
             for grp in group_names_order:
                 infl = per_group_inflow.get(grp)
                 if infl is None or city_id >= len(infl):
                     continue
                 val = float(infl[city_id])
-                items.append((grp, f"{val:.0f}"))
+                if total_inflow > 0:
+                    pct = (val / total_inflow) * 100.0
+                    items.append((grp, f"{val:.0f} ({pct:.0f}%)"))
+                else:
+                    items.append((grp, f"{val:.0f}"))
                 if val > top_value:
                     top_value = val
                     top_group = grp
             html.append(_block_header("Градообразующие функции:"))
-            html.append(_list_kv(items))
+            html.append(_list_kv_aligned(items))
         else:
             html.append(_block_header("Градообразующие функции:"))
             html.append("<i>нет данных по типам</i>")
 
         if top_group is not None:
-            html.append(_block_header("Наиважнейшая градообразующая функция:"))
+            html.append(_block_header("Главная градообразующая функция:"))
             html.append(f"<div>{top_group}</div>")
 
         return "".join(html)
@@ -350,3 +362,109 @@ def create_anchor_flow_map(
     folium.LayerControl(collapsed=False).add_to(fmap)
 
     return fmap
+
+
+def save_static_anchor_flow_png(
+    matrix: csr_matrix,
+    gdf: gpd.GeoDataFrame,
+    analysis_results: dict,
+    out_path: str,
+    polygons_gdf: gpd.GeoDataFrame | None = None,
+    *,
+    focus: str = "anchors",
+    max_edges: int = 5000,
+    dpi: int = 200,
+):
+    """
+    Render a static PNG map with anchor-related flows and cities using Matplotlib.
+
+    - focus: "anchors" to show flows to/from anchors only, or "all" for all flows
+    - max_edges: limit number of strongest flows drawn (by weight)
+    Returns the saved path.
+    """
+    if gdf.crs is None:
+        raise ValueError("GeoDataFrame has no CRS; unable to plot.")
+
+    # Work in WGS84 for simplicity
+    gdf4326 = gdf.to_crs(epsg=4326) if gdf.crs.to_string().lower() != "epsg:4326" else gdf
+    poly4326 = None
+    if polygons_gdf is not None:
+        poly4326 = polygons_gdf.to_crs(epsg=4326) if polygons_gdf.crs and polygons_gdf.crs.to_string().lower() != "epsg:4326" else polygons_gdf
+
+    # Ensure city_id index
+    if 'city_id' not in gdf4326.columns:
+        gdf4326 = gdf4326.reset_index(drop=True)
+        gdf4326['city_id'] = gdf4326.index
+        gdf4326 = gdf4326.set_index('city_id')
+
+    is_anchor = gdf4326['is_anchor_settlement'].astype(bool)
+    id_to_point = gdf4326['geometry']
+
+    # Extract edges
+    rows, cols, data = find(matrix)
+    if len(data) == 0:
+        raise ValueError("Movement matrix is empty; nothing to plot.")
+
+    # Filter to anchor-related flows if requested
+    if focus == "anchors":
+        mask = is_anchor.reindex(rows, fill_value=False).values | is_anchor.reindex(cols, fill_value=False).values
+    else:
+        mask = np.ones_like(data, dtype=bool)
+
+    rows = rows[mask]
+    cols = cols[mask]
+    data = data[mask]
+
+    # Keep strongest flows
+    if max_edges is not None and len(data) > max_edges:
+        order = np.argsort(data)[-max_edges:]
+        rows, cols, data = rows[order], cols[order], data[order]
+
+    # Build line segments and colors
+    nonzero = data[data > 0]
+    vmin = np.log10(nonzero.min() + 1e-10)
+    vmax = np.log10(nonzero.max() + 1e-10)
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap('RdYlGn_r')
+
+    segments = []
+    colors = []
+    for r, c, w in zip(rows, cols, data):
+        p_from = id_to_point.get(r)
+        p_to = id_to_point.get(c)
+        if p_from is None or p_to is None:
+            continue
+        segments.append([(p_from.x, p_from.y), (p_to.x, p_to.y)])
+        colors.append(cmap(norm(np.log10(w + 1e-10))))
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 8), dpi=dpi)
+
+    # Basemap polygons
+    if poly4326 is not None and not poly4326.empty:
+        poly4326.plot(ax=ax, facecolor="#cddff7", edgecolor="#7a869a", linewidth=0.5, alpha=0.5)
+
+    # Draw flows
+    if segments:
+        lc = LineCollection(segments, colors=colors, linewidths=0.6, alpha=0.6)
+        ax.add_collection(lc)
+
+    # Plot cities
+    anchors = gdf4326[is_anchor]
+    regular = gdf4326[~is_anchor]
+    if not regular.empty:
+        regular.plot(ax=ax, markersize=6, color="#555555", alpha=0.8)
+    if not anchors.empty:
+        anchors.plot(ax=ax, markersize=20, color="#d62728", alpha=0.9)
+
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("Anchor-related mobility flows")
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.margins(0.02)
+    plt.tight_layout()
+
+    out_path = str(out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    return out_path

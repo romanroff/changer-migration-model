@@ -1,9 +1,10 @@
 import os
-import itertools
 from dataclasses import dataclass, field
 from functools import singledispatchmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+import concurrent.futures
+import json
 
 import geopandas as gpd
 import numpy as np
@@ -15,7 +16,7 @@ from tqdm.auto import tqdm
 
 from townsnet import Region, Provision
 from changer_migration.ueqi import UEQI_GROUPS
-from changer_migration.creating_map import create_anchor_flow_map
+from changer_migration.creating_map import create_anchor_flow_map, save_static_anchor_flow_png
 
 # ---- Константы/настройки ----
 OFFSET_PX: float = 300.0  # сдвиг при генерации новой точки сервиса на N метров
@@ -50,6 +51,9 @@ class MigrationFlowModel:
     group_matrices: Dict[str, csr_matrix] = field(default_factory=dict, init=False)
     group_flows: Dict[str, gpd.GeoDataFrame] = field(default_factory=dict, init=False)
     group_mobility: Dict[str, Dict[str, pd.DataFrame]] = field(default_factory=dict, init=False)
+
+    # --- JSON profiles by city ---
+    city_json: Dict[int, Dict] = field(default_factory=dict, init=False)
 
 
     # --- Параметры/seed ---
@@ -97,7 +101,34 @@ class MigrationFlowModel:
     def _set_infrastructure(self) -> None:
         assert self.model is not None
         df = self.model.get_service_types_df()
-        self.INFRASTRUCTURE = df.groupby("infrastructure")["name"].unique().apply(list).to_dict()
+        # Build custom grouped INFRASTRUCTURE with Russian labels
+        # Source columns: 'infrastructure' (category), 'name' (service type id)
+        infra_to_names = (
+            df.groupby("infrastructure")["name"].unique().apply(list).to_dict()
+        )
+
+        def get_names(keys: list[str]) -> list[str]:
+            out: list[str] = []
+            for k in keys:
+                out.extend(infra_to_names.get(k, []))
+            # keep order but unique
+            seen = set()
+            unique_out = []
+            for x in out:
+                if x not in seen:
+                    seen.add(x)
+                    unique_out.append(x)
+            return unique_out
+
+        self.INFRASTRUCTURE = {
+            "Безопасность": get_names(["SAFENESS"]),
+            "Здравоохранение": get_names(["HEALTHCARE"]),
+            "Культура": get_names(["LEISURE","RECREATION","COMMERCE",]),
+            "Образование": get_names(["EDUCATION"]),
+            "Спорт": get_names(["SPORT"]),
+            "Туризм": get_names(["CATERING"]),
+            "Услуги": get_names(["SERVICE"]),
+        }
 
     def _set_services(self) -> None:
         assert self.model is not None
@@ -227,7 +258,6 @@ class MigrationFlowModel:
         self,
         *,
         matrix_dir: str | Path = DEFAULT_MATRIX_DIR,
-        use_updated: bool = False,
         average: bool = True,
         anchors: Optional[pd.DataFrame] = None,
     ) -> None:
@@ -254,13 +284,9 @@ class MigrationFlowModel:
             for service in tqdm(services, desc=f"Группа {group_name}"):
                 try:
                     filename = f"{service}_links.parquet"
-                    updated_path = base_path / UPDATED_SUBDIR / filename
                     file_path = base_path / filename
 
-                    if use_updated and updated_path.exists():
-                        df_rel = pd.read_parquet(updated_path)
-                        source = "updated"
-                    elif file_path.exists():
+                    if file_path.exists():
                         df_rel = pd.read_parquet(file_path)
                         source = "original"
                     else:
@@ -317,9 +343,16 @@ class MigrationFlowModel:
         anchor_gdf["city_id"] = anchor_gdf.index
         self.anchor = anchor_gdf.set_index("city_id")
 
-    def calculate_provision(self, services: str | Sequence[str], data_path: str | Path | None = None) -> None:
+    def calculate_provision(
+        self,
+        services: str | Sequence[str],
+        data_path: str | Path | None = None,
+        *,
+        n_jobs: int = -1,
+    ) -> None:
         """
         Пересчитать provision по заданным сервисам и сохранить parquet в data_path/updated.
+        Можно распараллелить по сервисам, указав n_jobs. Значение -1 использует все доступные ядра.
         """
         if self.model is None or self.provision is None:
             raise RuntimeError("Model is not initialized.")
@@ -328,10 +361,31 @@ class MigrationFlowModel:
         out_dir = Path(data_path) if data_path is not None else DEFAULT_MATRIX_DIR / UPDATED_SUBDIR
         os.makedirs(out_dir, exist_ok=True)
 
-        for service_type in self.model.service_types:
-            if service_type.name in services:
-                _, _, _, l_gdf = self.provision.calculate(service_type)
-                l_gdf.to_parquet(out_dir / f"{service_type.name}_links.parquet")
+        targets = [st for st in self.model.service_types if st.name in services]
+
+        def _compute_and_save(st) -> str:
+            # Создаём отдельный Provision на поток, чтобы избежать гонок состояния
+            prov = Provision(region=self.model)
+            _, _, _, l_gdf = prov.calculate(st)
+            l_gdf.to_parquet(out_dir / f"{st.name}_links.parquet")
+            return st.name
+
+        if not targets:
+            return
+
+        if n_jobs == 1:
+            for st in targets:
+                _compute_and_save(st)
+        else:
+            workers = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                fut2name = {ex.submit(_compute_and_save, st): st.name for st in targets}
+                for fut in concurrent.futures.as_completed(fut2name):
+                    name = fut2name[fut]
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"[calculate_provision] Error while processing {name}: {e}")
 
     def _compute_self_sufficiency(self, movement_matrix_csr: csr_matrix) -> Tuple[pd.DataFrame, np.ndarray]:
         """Вычисляет самообеспеченность каждого города."""
@@ -544,7 +598,139 @@ class MigrationFlowModel:
 
         mobility_current = _analyze_for_matrix(self.combined_matrix)
         self.mobility = mobility_current
+
+        # Build/update per-city JSON profile after analysis
+        try:
+            self._build_city_json()
+        except Exception as e:
+            # Non-fatal; still return analysis results
+            print(f"[analyze_mobility] Failed to build city_json: {e}")
         return self.group_mobility
+
+    def _build_city_json(self) -> None:
+        """Builds a JSON-like dict with full city info for map/tooltips.
+
+        Produces self.city_json keyed by city_id with structure:
+        {
+          city_id: {
+            'name': str,
+            'опорный пункт': bool,
+            'потенциальный опорный пункт': bool,
+            'Население': int,
+            'Самообеспеченность, %': float,
+            'Градообслуживающие функции': { group: {'доля, %': float, 'население': int} },
+            'Градообразующие функции': { group: {'приток': float, 'доля, %': float} },
+            'Наиважнейшая градообразующая функция': str | None,
+          }
+        }
+        """
+        if self.anchor is None or self.mobility is None:
+            raise RuntimeError("Run load_migration_matrix() and analyze_mobility() first.")
+
+        n = len(self.anchor)
+        # Potential anchors (by combined matrix)
+        pot_df = self.mobility.get("potential_anchors", pd.DataFrame())
+        potential_ids = set(pot_df["city_id"].tolist()) if (isinstance(pot_df, pd.DataFrame) and not pot_df.empty) else set()
+
+        # Overall self-sufficiency by city
+        ss_df = self.mobility.get("self_sufficiency", pd.DataFrame())
+        if not isinstance(ss_df, pd.DataFrame) or ss_df.empty:
+            raise RuntimeError("Self sufficiency data is missing after analyze_mobility().")
+        ss_df = ss_df.set_index("city_id")
+
+        # Per-group self sufficiency shares (0..1)
+        per_group_self: Dict[str, pd.Series] = {}
+        for grp, res in self.group_mobility.items():
+            df_self = res.get("self_sufficiency", pd.DataFrame())
+            if df_self is None or df_self.empty:
+                continue
+            s = df_self.set_index("city_id")["self_sufficiency_pct"] / 100.0
+            per_group_self[grp] = s
+
+        # Per-group inflow arrays
+        per_group_inflow: Dict[str, np.ndarray] = {}
+        for grp, mat in self.group_matrices.items():
+            try:
+                csc = csr_matrix(mat).tocsc()
+                inflow = np.asarray(csc.sum(axis=0)).ravel()
+                per_group_inflow[grp] = inflow
+            except Exception:
+                continue
+
+        profiles: Dict[int, Dict] = {}
+        # Iterate in stable order of anchor index
+        for city_id in self.anchor.index:
+            row = self.anchor.loc[city_id]
+            name = str(row["town_name"]) if "town_name" in row else str(city_id)
+            pop_val = int(row.get("population", 0)) if not pd.isna(row.get("population", np.nan)) else 0
+            is_anchor_city = bool(row.get("is_anchor_settlement", False))
+            is_potential = (not is_anchor_city) and (city_id in potential_ids)
+
+            # Services (self-sufficiency per group)
+            service_info: Dict[str, Dict[str, float | int]] = {}
+            for grp in self.INFRASTRUCTURE.keys():
+                share = None
+                s = per_group_self.get(grp)
+                if s is not None and city_id in s.index:
+                    share = float(s.loc[city_id])
+                if share is None or np.isnan(share):
+                    continue
+                served = int(round(pop_val * share)) if pop_val else 0
+                service_info[grp] = {
+                    "доля, %": round(share * 100.0, 2),
+                    "население": served,
+                }
+
+            # Industry (inflow per group + shares)
+            inflow_info: Dict[str, Dict[str, float]] = {}
+            total_inflow = 0.0
+            for grp in self.INFRASTRUCTURE.keys():
+                infl = per_group_inflow.get(grp)
+                val = float(infl[city_id]) if infl is not None and city_id < len(infl) else 0.0
+                total_inflow += val
+            top_group = None
+            top_value = -1.0
+            for grp in self.INFRASTRUCTURE.keys():
+                infl = per_group_inflow.get(grp)
+                val = float(infl[city_id]) if infl is not None and city_id < len(infl) else 0.0
+                pct = (val / total_inflow * 100.0) if total_inflow > 0 else 0.0
+                inflow_info[grp] = {"приток": round(val, 2), "доля, %": round(pct, 2)}
+                if val > top_value:
+                    top_value = val
+                    top_group = grp
+
+            profile = {
+                "Название": name,
+                "Опорный пункт": is_anchor_city,
+                "Потенциальный опорный пункт": is_potential,
+                "Население": pop_val,
+                "Самообеспеченность, %": float(ss_df.at[city_id, "self_sufficiency_pct"]) if city_id in ss_df.index else None,
+                "Градообслуживающие функции": service_info,
+                "Градообразующие функции": inflow_info,
+                "Наиважнейшая градообразующая функция": top_group,
+            }
+            profiles[city_id] = profile
+
+        self.city_json = profiles
+
+    def save_city_json(self, path: str | Path, by: str = "id") -> None:
+        """Save per-city JSON to file.
+
+        by='id' -> keys are city_id (as strings).
+        by='name' -> keys are city names.
+        """
+        if not self.city_json:
+            self._build_city_json()
+
+        if by == "name":
+            data = {v["name"]: v for v in self.city_json.values()}
+        else:
+            data = {str(k): v for k, v in self.city_json.items()}
+
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def create_map(self, polygons_gdf: Optional[gpd.GeoDataFrame] = None):
         if self.combined_matrix is None or self.anchor is None or self.mobility is None:
@@ -556,6 +742,28 @@ class MigrationFlowModel:
             polygons_gdf=polygons_gdf,
             group_mobility=self.group_mobility,
             group_matrices=self.group_matrices,
+        )
+
+    def save_static_map_png(
+        self,
+        out_path: str,
+        polygons_gdf: Optional[gpd.GeoDataFrame] = None,
+        *,
+        focus: str = "anchors",
+        max_edges: int = 5000,
+        dpi: int = 200,
+    ) -> str:
+        if self.combined_matrix is None or self.anchor is None or self.mobility is None:
+            raise RuntimeError("Run load_migration_matrix() and analyze_mobility() first.")
+        return save_static_anchor_flow_png(
+            self.combined_matrix,
+            self.anchor,
+            self.mobility,
+            out_path,
+            polygons_gdf=polygons_gdf,
+            focus=focus,
+            max_edges=max_edges,
+            dpi=dpi,
         )
 
 
