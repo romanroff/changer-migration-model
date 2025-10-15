@@ -15,6 +15,7 @@ dependencies = [
   "geojson",
   "h3",
   "statsmodels",
+  "ipywidgets"
 ]
 keywords = ["geospatial", "migration", "flows", "urban"]
 classifiers = [
